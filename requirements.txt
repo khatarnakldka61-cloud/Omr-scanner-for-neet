@@ -1,6 +1,7 @@
 streamlit
 opencv-python-headless
 numpy
-imutils
-Pillow
 scipy
+imutils
+pillow
+pandas
