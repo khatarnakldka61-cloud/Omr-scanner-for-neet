@@ -38,7 +38,8 @@ MARKS_CORRECT = 4
 MARKS_INCORRECT = -1
 MARKS_UNATTEMPTED = 0
 
-FILL_THRESHOLD = 0.28      # fraction of sampled ROI that must be "ink" to count as filled
+# UPDATED: Lowered strictness so the app stops reading bubbles as 'None'
+FILL_THRESHOLD = 0.15      
 AMBIGUOUS_MARGIN = 0.06    # if top-2 fill ratios are this close, flag as multi-mark
 
 OPTION_LABELS = ["1", "2", "3", "4"]
