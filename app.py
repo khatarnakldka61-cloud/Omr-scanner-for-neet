@@ -2,18 +2,6 @@
 NEET OMR Checker — Production-grade Streamlit app
 ==================================================
 
-Fixes over the previous version:
- 1. No hardcoded 720-contour requirement. Bubble detection is used only to
-    estimate grid boundaries; the full 180x4 grid is then generated
-    mathematically (interpolation) and each expected position is sampled
-    directly. Missing bubbles / extra noise contours no longer crash the app.
- 2. Adaptive thresholding + morphological cleanup for lighting/shadow
-    resilience, instead of a single global threshold.
- 3. Perspective transform (4-point warp) when a document boundary is found,
-    with a rotation-based deskew fallback when it isn't.
- 4. Manual correction UI (editable table) so a user can fix any
-    misdetected question without re-uploading a photo.
-
 Dependencies: streamlit, opencv-python-headless, numpy, scipy, imutils, pillow, pandas
 """
 
@@ -38,28 +26,21 @@ MARKS_CORRECT = 4
 MARKS_INCORRECT = -1
 MARKS_UNATTEMPTED = 0
 
-# UPDATED: Lowered strictness so the app stops reading bubbles as 'None'
+# Low strictness to handle different lighting and pen types
 FILL_THRESHOLD = 0.15      
-AMBIGUOUS_MARGIN = 0.06    # if top-2 fill ratios are this close, flag as multi-mark
+AMBIGUOUS_MARGIN = 0.06    
 
 OPTION_LABELS = ["1", "2", "3", "4"]
-
-# Warp canvas size used after perspective correction (keeps geometry stable)
-WARP_W, WARP_H = 1400, 1980
-
 
 # ----------------------------------------------------------------------------
 # BASIC IMAGE UTILITIES
 # ----------------------------------------------------------------------------
 def load_image_from_upload(uploaded_file):
-    """Read an uploaded file (camera_input or file_uploader) into a BGR numpy array."""
     image = Image.open(uploaded_file).convert("RGB")
     arr = np.array(image)
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-
 def order_points(pts):
-    """Order 4 points as top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -69,8 +50,9 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-
-def four_point_transform(image, pts, out_w=WARP_W, out_h=WARP_H):
+def four_point_transform(image, pts):
+    # Only used if a full page is detected
+    out_w, out_h = 1400, 1980 
     rect = order_points(pts)
     dst = np.array(
         [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
@@ -80,12 +62,10 @@ def four_point_transform(image, pts, out_w=WARP_W, out_h=WARP_H):
     warped = cv2.warpPerspective(image, M, (out_w, out_h))
     return warped
 
-
 # ----------------------------------------------------------------------------
 # DOCUMENT DETECTION / DESKEW 
 # ----------------------------------------------------------------------------
 def try_find_document_corners(image):
-    """Attempt to find a 4-point paper/sheet boundary. Returns None on failure."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 50, 150)
@@ -106,18 +86,12 @@ def try_find_document_corners(image):
             return approx.reshape(4, 2)
     return None
 
-
 def deskew_via_rotation(image):
-    """
-    Fallback when no clean 4-point boundary is found: estimate a global tilt
-    angle from the dominant orientation of dark ink blobs and rotate to
-    correct it.
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
     coords = np.column_stack(np.where(thresh > 0))
     if coords.shape[0] < 50:
-        return image  # not enough signal, leave as-is
+        return image  
 
     angle = cv2.minAreaRect(coords)[-1]
     if angle < -45:
@@ -136,11 +110,7 @@ def deskew_via_rotation(image):
     )
     return rotated
 
-
 def get_normalized_sheet(image):
-    """
-    Returns a normalized, upright, consistently-sized version of the sheet.
-    """
     corners = try_find_document_corners(image)
     if corners is not None:
         try:
@@ -148,19 +118,15 @@ def get_normalized_sheet(image):
         except Exception:
             pass
 
+    # FIXED: Just rotate it if it's crooked, but DO NOT forcefully resize it. 
+    # This preserves perfectly cropped screenshots!
     deskewed = deskew_via_rotation(image)
-    resized = cv2.resize(deskewed, (WARP_W, WARP_H))
-    return resized, "deskew-fallback"
-
+    return deskewed, "deskew-fallback"
 
 # ----------------------------------------------------------------------------
 # PREPROCESSING FOR BUBBLE / INK DETECTION
 # ----------------------------------------------------------------------------
 def build_binary_ink_image(warped):
-    """
-    Produce a clean binary image where filled-in pencil/pen marks are white
-    (255) and background/paper is black (0), robust to uneven lighting.
-    """
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -179,21 +145,18 @@ def build_binary_ink_image(warped):
 
     return binary
 
-
 # ----------------------------------------------------------------------------
 # BUBBLE DETECTION -> GRID BOUNDARY ESTIMATION
 # ----------------------------------------------------------------------------
 def find_bubble_like_contours(binary):
-    """
-    Loosely detect bubble-shaped blobs to estimate grid boundaries.
-    """
     cnts = cv2.findContours(binary.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cnts = imutils.grab_contours(cnts)
 
     candidates = []
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
-        if w < 12 or h < 12:
+        # Lowered size limit to 8px so it doesn't ignore bubbles in cropped images
+        if w < 8 or h < 8:
             continue
         ar = w / float(h)
         if not (0.6 <= ar <= 1.4):
@@ -201,18 +164,12 @@ def find_bubble_like_contours(binary):
         candidates.append((x + w / 2.0, y + h / 2.0, w, h))
     return candidates
 
-
 def robust_range(values, low_pct=3, high_pct=97):
-    """Percentile-based min/max — ignores stray outlier contours."""
     lo = np.percentile(values, low_pct)
     hi = np.percentile(values, high_pct)
     return lo, hi
 
-
 def split_into_columns(candidates, warp_w, k=NUM_COLUMNS):
-    """
-    Assigns each candidate bubble to one of k columns using gap-based 1D clustering.
-    """
     if len(candidates) < k * 5:
         edges = np.linspace(0, warp_w, k + 1)
         return edges
@@ -232,15 +189,12 @@ def split_into_columns(candidates, warp_w, k=NUM_COLUMNS):
         edges = np.linspace(0, warp_w, k + 1)
     return edges
 
-
 def build_expected_grid(candidates, warp_w, warp_h):
-    """
-    Turns a loose set of detected candidates into a clean 4 x 45 x 4 matrix.
-    """
     col_edges = split_into_columns(candidates, warp_w)
 
     radii = [max(w, h) / 2.0 for (_, _, w, h) in candidates] if candidates else []
-    avg_radius = float(np.median(radii)) if radii else 14.0
+    # Dynamic radius sizing for smaller cropped images
+    avg_radius = float(np.median(radii)) if radii else (warp_w * 0.015)
 
     grid = np.zeros((NUM_COLUMNS, ROWS_PER_COLUMN, OPTIONS_PER_Q, 2), dtype="float32")
 
@@ -251,7 +205,8 @@ def build_expected_grid(candidates, warp_w, warp_h):
         if len(col_pts) >= 10:
             y_lo, y_hi = robust_range([c[1] for c in col_pts])
         else:
-            y_lo, y_hi = warp_h * 0.06, warp_h * 0.97
+            # Tighter margins to accommodate tightly cropped images
+            y_lo, y_hi = warp_h * 0.02, warp_h * 0.98
 
         if len(col_pts) >= 10:
             x_lo_opt, x_hi_opt = robust_range([c[0] for c in col_pts])
@@ -268,12 +223,10 @@ def build_expected_grid(candidates, warp_w, warp_h):
 
     return grid, avg_radius
 
-
 # ----------------------------------------------------------------------------
 # FILL CLASSIFICATION
 # ----------------------------------------------------------------------------
 def sample_fill_ratio(binary_ink, cx, cy, radius):
-    """Fraction of 'ink' pixels inside a circular ROI at (cx, cy)."""
     h, w = binary_ink.shape
     cx, cy = int(round(cx)), int(round(cy))
     r = max(int(round(radius * 0.85)), 4)  
@@ -293,9 +246,7 @@ def sample_fill_ratio(binary_ink, cx, cy, radius):
         return 0.0
     return ink_pixels / float(total_pixels)
 
-
 def classify_all_answers(binary_ink, grid, radius):
-    """Returns a list of 180 dicts: {question, answer, status, ratios}"""
     results = []
     q_num = 1
     for col in range(NUM_COLUMNS):
@@ -336,16 +287,18 @@ def classify_all_answers(binary_ink, grid, radius):
             q_num += 1
     return results
 
-
 # ----------------------------------------------------------------------------
 # FULL PIPELINE
 # ----------------------------------------------------------------------------
 def process_sheet_image(image):
-    """Runs the full pipeline on a raw uploaded image. Returns (results, debug_info)."""
     warped, method = get_normalized_sheet(image)
+    # Dynamically extract actual width and height of the user's specific image
+    img_h, img_w = warped.shape[:2]
+    
     binary_ink = build_binary_ink_image(warped)
     candidates = find_bubble_like_contours(binary_ink)
-    grid, radius = build_expected_grid(candidates, WARP_W, WARP_H)
+    
+    grid, radius = build_expected_grid(candidates, img_w, img_h)
     results = classify_all_answers(binary_ink, grid, radius)
 
     debug_info = {
@@ -357,7 +310,6 @@ def process_sheet_image(image):
         "grid": grid,
     }
     return results, debug_info
-
 
 # ----------------------------------------------------------------------------
 # SCORING
@@ -413,14 +365,9 @@ def score_sheet(student_results, key_results):
     }
     return rows, summary
 
-
 # ----------------------------------------------------------------------------
 # STREAMLIT UI
 # ----------------------------------------------------------------------------
-def results_to_answer_dict(results):
-    return {r["question"]: r["answer"] for r in results}
-
-
 def render_upload_and_process(label, key_prefix):
     st.subheader(label)
     col1, col2 = st.columns(2)
@@ -457,9 +404,7 @@ def render_upload_and_process(label, key_prefix):
 
     return results, debug_info
 
-
 def editable_answer_table(results, key_prefix):
-    """Lets the user manually fix any misdetected answers before scoring."""
     df = pd.DataFrame(
         [{"Question": r["question"], "Answer": r["answer"] if r["answer"] else ""} for r in results]
     )
@@ -482,7 +427,6 @@ def editable_answer_table(results, key_prefix):
         status = "answered" if ans else "unattempted"
         corrected.append({**r, "answer": ans, "status": status})
     return corrected
-
 
 def main():
     st.set_page_config(page_title="NEET OMR Checker", page_icon="✅", layout="wide")
@@ -540,7 +484,6 @@ def main():
             )
     else:
         st.info("Upload or capture both the answer key and the student sheet to calculate a score.")
-
 
 if __name__ == "__main__":
     main()
